@@ -119,16 +119,30 @@ def sig_str(p):
     if p < 0.05: return "*"
     return "n.s."
 
+def col_letter(n):
+    """Convert 0-based index to Origin-style column name: A, B, ..., Z, AA, AB, ..."""
+    result = ""
+    while True:
+        result = chr(ord('A') + n % 26) + result
+        n = n // 26 - 1
+        if n < 0:
+            break
+    return "Col" + result
+
+def make_default_df(ncols=3, nrows=10):
+    return pd.DataFrame({col_letter(i): pd.array([np.nan]*nrows, dtype=float) for i in range(ncols)})
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SESSION STATE
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def init_state():
     defaults = {
-        "df": pd.DataFrame({f"Col{i+1}": pd.array([np.nan]*10, dtype=float) for i in range(3)}),
+        "df": make_default_df(),
         "formulas": {},
         "col_meta": {},  # {col: {"name":"", "units":"", "comments":""}}
         "analysis_log": [],
+        "table_ver": 0,  # increment to force data_editor re-creation
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -194,6 +208,40 @@ def num_cols():
     df = get_df()
     return [c for c in df.columns if pd.to_numeric(df[c], errors='coerce').notna().any()]
 
+def col_fmt(c):
+    """Format column for dropdown display: ColA: Temperature (K)"""
+    if c == "(none)": return "(none)"
+    lbl = get_col_label(c)
+    return f"{c}: {lbl}" if lbl != c else c
+
+def bump_table():
+    """Increment table version to force data_editor widget re-creation."""
+    st.session_state.table_ver = st.session_state.get("table_ver", 0) + 1
+
+def load_data(df_raw):
+    """Load a dataframe: rename columns to ColA..ColZ..ColAA, move original headers to display names."""
+    n_cols = len(df_raw.columns)
+    new_names = [col_letter(i) for i in range(n_cols)]
+    old_names = list(df_raw.columns)
+
+    # Check if headers look like text (not just integers from headerless CSV)
+    has_text_headers = any(isinstance(h, str) and not h.replace('.','',1).replace('-','',1).isdigit()
+                          for h in old_names)
+
+    df_new = df_raw.copy()
+    df_new.columns = new_names
+
+    st.session_state.formulas = {}
+    meta = {}
+    for i, nn in enumerate(new_names):
+        if has_text_headers:
+            meta[nn] = {"name": str(old_names[i]), "units": "", "comments": ""}
+        else:
+            meta[nn] = {"name": "", "units": "", "comments": ""}
+    st.session_state.col_meta = meta
+    set_df(df_new)
+    bump_table()
+
 # ═══════════════════════════════════════════════════════════════════════════════
 #  SIDEBAR - FILE OPERATIONS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -206,64 +254,115 @@ with st.sidebar:
     uploaded = st.file_uploader("Upload CSV or Excel", type=["csv", "tsv", "xlsx", "xls"],
                                  key="file_uploader")
     if uploaded is not None:
-        try:
-            if uploaded.name.endswith((".xlsx", ".xls")):
-                df_new = pd.read_excel(uploaded)
-            else:
-                df_new = pd.read_csv(uploaded)
-            set_df(df_new)
-            st.session_state.formulas = {}
-            st.session_state.col_meta = {}
-            st.success(f"Loaded: {df_new.shape[0]} rows x {df_new.shape[1]} cols")
-        except Exception as e:
-            st.error(f"Error loading file: {e}")
+        # Use a flag to only load once per file
+        fkey = f"loaded_{uploaded.name}_{uploaded.size}"
+        if fkey not in st.session_state:
+            try:
+                if uploaded.name.endswith((".xlsx", ".xls")):
+                    df_raw = pd.read_excel(uploaded)
+                else:
+                    df_raw = pd.read_csv(uploaded)
+                load_data(df_raw)
+                st.session_state[fkey] = True
+                st.rerun()
+            except Exception as e:
+                st.error(f"Error loading file: {e}")
 
     pasted = st.text_area("Or paste data (tab/comma separated)", height=80, key="paste_area")
     if st.button("Load pasted data") and pasted.strip():
         try:
             sep = "\t" if "\t" in pasted else ","
-            df_new = pd.read_csv(io.StringIO(pasted), sep=sep)
-            set_df(df_new)
-            st.session_state.formulas = {}
-            st.session_state.col_meta = {}
-            st.success(f"Loaded: {df_new.shape[0]} rows x {df_new.shape[1]} cols")
+            df_raw = pd.read_csv(io.StringIO(pasted), sep=sep)
+            load_data(df_raw)
+            st.rerun()
         except Exception as e:
             st.error(str(e))
 
     st.markdown("---")
     st.subheader("Table Operations")
+
+    # +Column | -Column
     c1, c2 = st.columns(2)
     with c1:
         if st.button("+Column", use_container_width=True):
             df = get_df()
-            n = f"Col{len(df.columns)+1}"
-            df[n] = np.nan
+            new_col = col_letter(len(df.columns))
+            df[new_col] = np.nan
+            st.session_state.col_meta[new_col] = {"name": "", "units": "", "comments": ""}
             set_df(df)
+            bump_table()
+            st.rerun()
     with c2:
+        if st.button("\u2212Column", use_container_width=True):
+            df = get_df()
+            if len(df.columns) > 1:
+                drop_col = df.columns[-1]
+                df = df.drop(columns=[drop_col])
+                st.session_state.col_meta.pop(drop_col, None)
+                st.session_state.formulas.pop(drop_col, None)
+                set_df(df)
+                bump_table()
+                st.rerun()
+
+    # +Row | -Row
+    c3, c4 = st.columns(2)
+    with c3:
+        if st.button("+Row", use_container_width=True):
+            df = get_df()
+            new = pd.DataFrame({c: [np.nan] for c in df.columns})
+            set_df(pd.concat([df, new], ignore_index=True))
+            bump_table()
+            st.rerun()
+    with c4:
+        if st.button("\u2212Row", use_container_width=True):
+            df = get_df()
+            if len(df) > 1:
+                set_df(df.iloc[:-1].reset_index(drop=True))
+                bump_table()
+                st.rerun()
+
+    # +10 Rows | +50 Rows
+    c5, c6 = st.columns(2)
+    with c5:
         if st.button("+10 Rows", use_container_width=True):
             df = get_df()
             new = pd.DataFrame({c: [np.nan]*10 for c in df.columns})
             set_df(pd.concat([df, new], ignore_index=True))
-    c3, c4 = st.columns(2)
-    with c3:
+            bump_table()
+            st.rerun()
+    with c6:
         if st.button("+50 Rows", use_container_width=True):
             df = get_df()
             new = pd.DataFrame({c: [np.nan]*50 for c in df.columns})
             set_df(pd.concat([df, new], ignore_index=True))
-    with c4:
+            bump_table()
+            st.rerun()
+
+    # Clear All (centered)
+    _, cc, _ = st.columns([1, 2, 1])
+    with cc:
         if st.button("Clear All", use_container_width=True):
-            set_df(pd.DataFrame({f"Col{i+1}": pd.array([np.nan]*10, dtype=float) for i in range(3)}))
+            set_df(make_default_df())
             st.session_state.formulas = {}
             st.session_state.col_meta = {}
+            bump_table()
+            st.rerun()
 
     st.markdown("---")
     st.subheader("Download")
     df = get_df()
-    csv_data = df.to_csv(index=False)
+    # Export CSV with display names as headers
+    export_df = df.copy()
+    export_df.columns = [get_col_label(c) for c in df.columns]
+    csv_data = export_df.to_csv(index=False)
     st.download_button("Download CSV", csv_data, "data.csv", "text/csv", use_container_width=True)
 
     if st.session_state.analysis_log:
-        log_text = "\n".join(st.session_state.analysis_log)
+        log_parts = []
+        if st.session_state.get("notes", "").strip():
+            log_parts.append(f"NOTES:\n{st.session_state.notes}\n{'='*60}\n")
+        log_parts.extend(st.session_state.analysis_log)
+        log_text = "\n".join(log_parts)
         st.download_button("Download Analysis (.txt)", log_text, "analysis.txt", "text/plain",
                           use_container_width=True)
 
@@ -280,38 +379,92 @@ tab_data, tab_graph, tab_analysis = st.tabs(["\U0001F4CB Data", "\U0001F4C8 Grap
 with tab_data:
     df = get_df()
 
-    # Column metadata
-    with st.expander("Column Metadata (names, units, formulas)", expanded=False):
-        meta_cols = st.columns(min(len(df.columns), 4))
-        for i, col in enumerate(df.columns):
-            with meta_cols[i % len(meta_cols)]:
-                st.markdown(f"**{col}**")
-                meta = st.session_state.col_meta.get(col, {"name":"","units":"","comments":""})
-                new_name = st.text_input("Display name", meta.get("name",""), key=f"meta_name_{col}")
-                new_units = st.text_input("Units", meta.get("units",""), key=f"meta_units_{col}")
-                new_formula = st.text_input("Formula", st.session_state.formulas.get(col,""),
-                                           key=f"meta_formula_{col}",
-                                           help="e.g. log(ColA), diff(ColB)/diff(ColC), shift(ColA,1)")
-                st.session_state.col_meta[col] = {"name": new_name, "units": new_units, "comments":""}
-                if new_formula.strip():
-                    st.session_state.formulas[col] = new_formula.strip()
-                elif col in st.session_state.formulas:
-                    del st.session_state.formulas[col]
+    # ── CSS for metadata row colors ──
+    st.markdown("""
+    <style>
+    .meta-row { display: flex; gap: 2px; margin-bottom: 1px; }
+    .meta-cell { flex: 1; padding: 4px 8px; font-size: 13px; border-radius: 3px; overflow: hidden; }
+    .meta-label { width: 70px; min-width: 70px; max-width: 70px; padding: 4px 6px;
+                  font-size: 12px; font-weight: 600; border-radius: 3px; }
+    .meta-name   { background: #dce8f0; }
+    .meta-units  { background: #e0f0d8; }
+    .meta-comment{ background: #f5f0d0; }
+    .meta-formula{ background: #f0dce8; }
+    .meta-header { background: #e8e8e8; font-weight: 700; }
+    </style>
+    """, unsafe_allow_html=True)
 
-    # Evaluate formulas
+    # ── Column header row ──
+    cols_list = list(df.columns)
+    n_c = len(cols_list)
+
+    # Build metadata HTML table
+    def meta_html_row(label, css_class, values):
+        cells = f'<div class="meta-label {css_class}">{label}</div>'
+        for v in values:
+            cells += f'<div class="meta-cell {css_class}">{v}</div>'
+        return f'<div class="meta-row">{cells}</div>'
+
+    # Header row with column IDs
+    hdr_vals = [f"<b>{c}</b>" for c in cols_list]
+    names = [st.session_state.col_meta.get(c, {}).get("name", "") for c in cols_list]
+    units = [st.session_state.col_meta.get(c, {}).get("units", "") for c in cols_list]
+    comments = [st.session_state.col_meta.get(c, {}).get("comments", "") for c in cols_list]
+    formulas = [st.session_state.formulas.get(c, "") for c in cols_list]
+
+    html = meta_html_row("", "meta-header", hdr_vals)
+    html += meta_html_row("Name", "meta-name", [n if n else '<span style="color:#aaa">...</span>' for n in names])
+    html += meta_html_row("Units", "meta-units", [u if u else '<span style="color:#aaa">...</span>' for u in units])
+    html += meta_html_row("Comment", "meta-comment", [c if c else '<span style="color:#aaa">...</span>' for c in comments])
+    html += meta_html_row("f(x)", "meta-formula", [f if f else '<span style="color:#aaa">...</span>' for f in formulas])
+
+    st.markdown(html, unsafe_allow_html=True)
+
+    # ── Editable metadata inputs ──
+    with st.expander("Edit metadata", expanded=False):
+        max_per_row = min(n_c, 4)
+        for start in range(0, n_c, max_per_row):
+            chunk = cols_list[start:start+max_per_row]
+            mcols = st.columns(len(chunk))
+            for j, col in enumerate(chunk):
+                with mcols[j]:
+                    st.markdown(f"**{col}**")
+                    meta = st.session_state.col_meta.get(col, {"name":"","units":"","comments":""})
+                    ver = st.session_state.get("table_ver", 0)
+                    nn = st.text_input("Name", meta.get("name",""), key=f"mn_{col}_{ver}")
+                    uu = st.text_input("Units", meta.get("units",""), key=f"mu_{col}_{ver}")
+                    cc = st.text_input("Comment", meta.get("comments",""), key=f"mc_{col}_{ver}")
+                    ff = st.text_input("Formula", st.session_state.formulas.get(col,""),
+                                      key=f"mf_{col}_{ver}",
+                                      help="e.g. log(ColA), diff(ColB)/diff(ColC), shift(ColA,1)")
+                    st.session_state.col_meta[col] = {"name": nn, "units": uu, "comments": cc}
+                    if ff.strip():
+                        st.session_state.formulas[col] = ff.strip()
+                    elif col in st.session_state.formulas:
+                        del st.session_state.formulas[col]
+
+    # ── Evaluate formulas ──
     if st.session_state.formulas:
         eval_formulas()
 
-    # Data info
+    # ── Data info ──
     nn = int(df.isna().sum().sum())
     nc_num = len(df.select_dtypes(include=[np.number]).columns)
     st.caption(f"{len(df)} rows x {len(df.columns)} cols ({nc_num} numeric"
                f"{f', {nn} missing' if nn else ''})")
 
-    # Editable table
+    # ── Editable data table ──
+    ver = st.session_state.get("table_ver", 0)
     edited = st.data_editor(df, num_rows="dynamic", use_container_width=True, height=500,
-                            key="data_editor")
+                            key=f"data_editor_{ver}")
     set_df(edited)
+
+    # ── Notes ──
+    st.markdown("---")
+    if "notes" not in st.session_state:
+        st.session_state.notes = ""
+    st.session_state.notes = st.text_area("Notes", st.session_state.notes, height=100,
+                                           placeholder="Add experiment notes here...")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  GRAPH TAB
@@ -332,15 +485,15 @@ with tab_graph:
         multi_stat = plot_type in ("Box Plot", "Violin Plot", "Histogram")
 
         if multi_stat:
-            sel_cols = st.multiselect("Columns", ncols, default=ncols[:2] if len(ncols)>=2 else ncols)
+            sel_cols = st.multiselect("Columns", ncols, default=ncols[:2] if len(ncols)>=2 else ncols, format_func=col_fmt)
         else:
-            xc = st.selectbox("X column", ncols, index=0 if ncols else 0)
-            yc = st.selectbox("Y column", ncols, index=min(1, len(ncols)-1) if len(ncols)>1 else 0)
+            xc = st.selectbox("X column", ncols, index=0 if ncols else 0, format_func=col_fmt)
+            yc = st.selectbox("Y column", ncols, index=min(1, len(ncols)-1) if len(ncols)>1 else 0, format_func=col_fmt)
 
         if plot_type == "Error Bar":
             err_opts = ["(none)"] + ncols
-            yerr_col = st.selectbox("Y error column", err_opts)
-            xerr_col = st.selectbox("X error column", err_opts)
+            yerr_col = st.selectbox("Y error column", err_opts, format_func=col_fmt)
+            xerr_col = st.selectbox("X error column", err_opts, format_func=col_fmt)
 
         # Style
         with st.expander("Style", expanded=False):
@@ -364,8 +517,9 @@ with tab_graph:
             xlabel = st.text_input("X label", "")
             ylabel = st.text_input("Y label", "")
 
-        # Advanced
+        # Advanced - only show relevant options
         with st.expander("Advanced", expanded=False):
+            # Axis options - always shown
             st.markdown("**Axis**")
             ac1, ac2 = st.columns(2)
             with ac1:
@@ -378,45 +532,68 @@ with tab_graph:
             log_y = st.checkbox("Log Y")
             minor_ticks = st.checkbox("Minor ticks")
 
-            st.markdown("---")
-            st.markdown("**Fit**")
-            do_fit = st.checkbox("Overlay fit")
-            fit_model = st.selectbox("Fit model", list(FIT_FUNCTIONS.keys()) + ["Custom..."])
-            if fit_model == "Custom...":
-                custom_expr = st.text_input("f(x) =", "", placeholder="Vmax*x/(Km+x)")
-                custom_params = st.text_input("Parameters", "", placeholder="Vmax, Km")
-            bounds_lo = st.text_input("Lower bounds", "", placeholder="-inf, 0, -inf")
-            bounds_hi = st.text_input("Upper bounds", "", placeholder="inf, 100, inf")
-            fit_extend = st.checkbox("Extend fit to axis range")
-            fit_confidence = st.checkbox("95% confidence band")
-            fit_ls = st.selectbox("Fit line style", ["--", "-", "-.", ":"],
-                                  format_func=lambda x: {"--":"Dashed","-":"Solid","-.":"Dash-dot",":":"Dotted"}[x])
-            fit_lw = st.slider("Fit line width", 0.5, 5.0, 2.0, 0.5)
+            # Fit - only for XY plot types
+            do_fit = False; fit_model = ""; bounds_lo = ""; bounds_hi = ""
+            fit_extend = False; fit_confidence = False; fit_ls = "--"; fit_lw = 2.0
+            custom_expr = ""; custom_params = ""
+            if plot_type in ("Scatter", "Line", "Line+Scatter", "Error Bar"):
+                st.markdown("---")
+                st.markdown("**Fit**")
+                do_fit = st.checkbox("Overlay fit")
+                fit_model = st.selectbox("Fit model", list(FIT_FUNCTIONS.keys()) + ["Custom..."])
+                if fit_model == "Custom...":
+                    custom_expr = st.text_input("f(x) =", "", placeholder="Vmax*x/(Km+x)")
+                    custom_params = st.text_input("Parameters", "", placeholder="Vmax, Km")
+                bounds_lo = st.text_input("Lower bounds", "", placeholder="-inf, 0, -inf")
+                bounds_hi = st.text_input("Upper bounds", "", placeholder="inf, 100, inf")
+                fit_extend = st.checkbox("Extend fit to axis range")
+                fit_confidence = st.checkbox("95% confidence band")
+                fit_ls = st.selectbox("Fit line style", ["--", "-", "-.", ":"],
+                                      format_func=lambda x: {"--":"Dashed","-":"Solid","-.":"Dash-dot",":":"Dotted"}[x])
+                fit_lw = st.slider("Fit line width", 0.5, 5.0, 2.0, 0.5)
 
-            st.markdown("---")
-            st.markdown("**Histogram**")
-            bin_mode = st.selectbox("Bin mode", ["Auto", "Bin count", "Bin width"])
-            if bin_mode == "Bin count":
-                n_bins = st.number_input("Number of bins", 2, 500, 30)
-            elif bin_mode == "Bin width":
-                bin_width = st.number_input("Bin width", 0.001, 1e6, 1.0, format="%.4f")
-            hist_density = st.checkbox("Normalize")
-            hist_stack = st.checkbox("Stacked")
+            # Histogram options
+            bin_mode = "Auto"; n_bins = 30; bin_width = 1.0
+            hist_density = False; hist_stack = False
+            if plot_type == "Histogram":
+                st.markdown("---")
+                st.markdown("**Histogram**")
+                bin_mode = st.selectbox("Bin mode", ["Auto", "Bin count", "Bin width"])
+                if bin_mode == "Bin count":
+                    n_bins = st.number_input("Number of bins", 2, 500, 30)
+                elif bin_mode == "Bin width":
+                    bin_width = st.number_input("Bin width", 0.001, 1e6, 1.0, format="%.4f")
+                hist_density = st.checkbox("Normalize")
+                hist_stack = st.checkbox("Stacked")
 
-            st.markdown("---")
-            st.markdown("**Box Plot**")
-            box_mean = st.checkbox("Show mean")
-            whisker_mode = st.selectbox("Whiskers", ["IQR (1.5x)", "Min/Max", "1 SD", "1 SEM"])
-            box_points = st.checkbox("Show data points", True)
+            # Box Plot options
+            box_mean = False; whisker_mode = "IQR (1.5x)"; box_points = True
+            if plot_type == "Box Plot":
+                st.markdown("---")
+                st.markdown("**Box Plot**")
+                box_mean = st.checkbox("Show mean")
+                whisker_mode = st.selectbox("Whiskers", ["IQR (1.5x)", "Min/Max", "1 SD", "1 SEM"])
+                box_points = st.checkbox("Show data points", True)
 
-            st.markdown("---")
-            st.markdown("**Violin Plot**")
-            violin_extend = st.checkbox("Extend to zero")
+            # Violin Plot options
+            violin_extend = False
+            if plot_type == "Violin Plot":
+                st.markdown("---")
+                st.markdown("**Violin Plot**")
+                violin_extend = st.checkbox("Extend to zero")
 
+            # Color mapping - only for scatter types
+            cmap = "viridis"; ccol = "(none)"
+            if plot_type in ("Scatter", "Line+Scatter"):
+                st.markdown("---")
+                st.markdown("**Color Mapping**")
+                cmap = st.selectbox("Colormap", SEQ_CMAPS)
+                ccol = st.selectbox("Color column", ["(none)"] + ncols, format_func=col_fmt)
+
+            # Export DPI - always shown
             st.markdown("---")
-            st.markdown("**Color Mapping**")
-            cmap = st.selectbox("Colormap", SEQ_CMAPS)
-            ccol = st.selectbox("Color column", ["(none)"] + ncols)
+            st.markdown("**Export**")
+            export_dpi = st.slider("Export DPI", 72, 600, 300, step=50)
 
     # ── PLOTTING ──
     with plot_col:
@@ -657,6 +834,9 @@ with tab_graph:
                     yl = ylabel if ylabel else (get_col_label(yc) if show_units else yc)
                     ax.set_xlabel(xl, fontsize=12*sc)
                     ax.set_ylabel(yl, fontsize=12*sc)
+                else:
+                    if xlabel: ax.set_xlabel(xlabel, fontsize=12*sc)
+                    if ylabel: ax.set_ylabel(ylabel, fontsize=12*sc)
                 if title: ax.set_title(title, fontsize=14*sc)
 
                 # Ranges
@@ -685,7 +865,7 @@ with tab_graph:
             with col:
                 buf = io.BytesIO()
                 try:
-                    fig.savefig(buf, format=fmt, dpi=300, bbox_inches='tight')
+                    fig.savefig(buf, format=fmt, dpi=export_dpi, bbox_inches='tight')
                     buf.seek(0)
                     st.download_button(f"Download .{fmt}", buf, f"plot.{fmt}",
                                       use_container_width=True)
@@ -715,7 +895,7 @@ with tab_analysis:
             "t-Test", "ANOVA (one-way)", "Normality", "Non-Parametric"])
 
         if analysis_type == "Descriptive Statistics":
-            ds_col = st.selectbox("Column", ncols_a, key="ds_col")
+            ds_col = st.selectbox("Column", ncols_a, key="ds_col", format_func=col_fmt)
             if st.button("Run", key="btn_ds"):
                 d = pd.to_numeric(df[ds_col], errors='coerce').dropna().values
                 add_log(f"Descriptive Statistics: {get_col_label(ds_col)}", header=True)
@@ -736,7 +916,7 @@ with tab_analysis:
 
         elif analysis_type == "Correlation Matrix":
             corr_cols = st.multiselect("Columns", ncols_a, default=ncols_a[:3] if len(ncols_a)>=3 else ncols_a,
-                                       key="corr_cols")
+                                       key="corr_cols", format_func=col_fmt)
             corr_method = st.selectbox("Method", ["Pearson", "Spearman"], key="corr_method")
             if st.button("Run", key="btn_corr") and len(corr_cols) >= 2:
                 sub = df[corr_cols].apply(pd.to_numeric, errors='coerce')
@@ -753,9 +933,9 @@ with tab_analysis:
                         add_log(f"  {get_col_label(c1)} vs {get_col_label(c2)}: r={r:.4f}, p={p:.4g} {sig_str(p)}")
 
         elif analysis_type == "Curve Fit":
-            cf_x = st.selectbox("X column", ncols_a, key="cf_x")
-            cf_y = st.selectbox("Y column", ncols_a, index=min(1, len(ncols_a)-1) if len(ncols_a)>1 else 0, key="cf_y")
-            cf_w = st.selectbox("Weight column (sigma)", ["(none)"] + ncols_a, key="cf_w")
+            cf_x = st.selectbox("X column", ncols_a, key="cf_x", format_func=col_fmt)
+            cf_y = st.selectbox("Y column", ncols_a, index=min(1, len(ncols_a)-1) if len(ncols_a)>1 else 0, key="cf_y", format_func=col_fmt)
+            cf_w = st.selectbox("Weight column (sigma)", ["(none)"] + ncols_a, key="cf_w", format_func=col_fmt)
             cf_model = st.selectbox("Model", list(FIT_FUNCTIONS.keys()) + ["Custom..."], key="cf_model")
             if cf_model == "Custom...":
                 cf_expr = st.text_input("f(x) =", "", key="cf_expr", placeholder="Vmax*x/(Km+x)")
@@ -833,9 +1013,9 @@ with tab_analysis:
 
         elif analysis_type == "t-Test":
             tt_type = st.selectbox("Type", ["Independent", "Paired", "One-sample"], key="tt_type")
-            tt_c1 = st.selectbox("Column 1", ncols_a, key="tt_c1")
+            tt_c1 = st.selectbox("Column 1", ncols_a, key="tt_c1", format_func=col_fmt)
             if tt_type != "One-sample":
-                tt_c2 = st.selectbox("Column 2", ncols_a, index=min(1, len(ncols_a)-1) if len(ncols_a)>1 else 0, key="tt_c2")
+                tt_c2 = st.selectbox("Column 2", ncols_a, index=min(1, len(ncols_a)-1) if len(ncols_a)>1 else 0, key="tt_c2", format_func=col_fmt)
             else:
                 tt_mu = st.number_input("Test value (mu)", value=0.0, key="tt_mu")
             tt_alt = st.selectbox("Alternative", ["two-sided", "less", "greater"], key="tt_alt")
@@ -866,7 +1046,7 @@ with tab_analysis:
                     add_log(f"  Error: {e}")
 
         elif analysis_type == "ANOVA (one-way)":
-            anova_cols = st.multiselect("Groups (columns)", ncols_a, key="anova_cols")
+            anova_cols = st.multiselect("Groups (columns)", ncols_a, key="anova_cols", format_func=col_fmt)
             if st.button("Run", key="btn_anova") and len(anova_cols) >= 2:
                 groups = [pd.to_numeric(df[c], errors='coerce').dropna().values for c in anova_cols]
                 add_log("ANOVA (one-way)", header=True)
@@ -877,7 +1057,7 @@ with tab_analysis:
                 add_log(f"  p = {p:.6g} {sig_str(p)}")
 
         elif analysis_type == "Normality":
-            nc = st.selectbox("Column", ncols_a, key="nc_col")
+            nc = st.selectbox("Column", ncols_a, key="nc_col", format_func=col_fmt)
             if st.button("Run", key="btn_norm"):
                 d = pd.to_numeric(df[nc], errors='coerce').dropna().values
                 add_log(f"Normality: {get_col_label(nc)}", header=True)
@@ -925,11 +1105,11 @@ with tab_analysis:
         elif analysis_type == "Non-Parametric":
             np_type = st.selectbox("Test", ["Mann-Whitney U", "Wilcoxon Signed-Rank",
                                              "Kruskal-Wallis"], key="np_type")
-            np_c1 = st.selectbox("Column 1", ncols_a, key="np_c1")
+            np_c1 = st.selectbox("Column 1", ncols_a, key="np_c1", format_func=col_fmt)
             if np_type != "Kruskal-Wallis":
-                np_c2 = st.selectbox("Column 2", ncols_a, index=min(1, len(ncols_a)-1) if len(ncols_a)>1 else 0, key="np_c2")
+                np_c2 = st.selectbox("Column 2", ncols_a, index=min(1, len(ncols_a)-1) if len(ncols_a)>1 else 0, key="np_c2", format_func=col_fmt)
             else:
-                np_multi = st.multiselect("Columns", ncols_a, key="np_multi")
+                np_multi = st.multiselect("Columns", ncols_a, key="np_multi", format_func=col_fmt)
 
             if st.button("Run", key="btn_np"):
                 add_log(f"Non-Parametric: {np_type}", header=True)
