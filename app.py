@@ -407,13 +407,13 @@ with tab_data:
         meta_df = pd.DataFrame(meta_data)
 
         gb_meta = GridOptionsBuilder.from_dataframe(meta_df)
-        gb_meta.configure_column("Column", editable=False, width=80, pinned="left",
+        gb_meta.configure_column("Column", editable=False, minWidth=90, maxWidth=110, pinned="left",
                                   cellStyle={"fontWeight": "bold", "backgroundColor": "#f0f0f0"})
-        gb_meta.configure_column("Name", editable=True, width=150)
-        gb_meta.configure_column("Units", editable=True, width=100)
-        gb_meta.configure_column("Formula", editable=True, width=200,
+        gb_meta.configure_column("Name", editable=True, minWidth=140, flex=2)
+        gb_meta.configure_column("Units", editable=True, minWidth=90, flex=1)
+        gb_meta.configure_column("Formula", editable=True, minWidth=180, flex=2,
                                   cellStyle={"fontFamily": "monospace", "backgroundColor": "#fdf6f0"})
-        gb_meta.configure_column("Comment", editable=True, width=200)
+        gb_meta.configure_column("Comment", editable=True, minWidth=140, flex=2)
         gb_meta.configure_grid_options(
             domLayout='autoHeight',
             suppressMovableColumns=True,
@@ -425,7 +425,6 @@ with tab_data:
             meta_df,
             gridOptions=gb_meta.build(),
             update_mode=GridUpdateMode.VALUE_CHANGED,
-            fit_columns_on_grid_load=True,
             theme="streamlit",
             key=f"meta_grid_{ver}",
         )
