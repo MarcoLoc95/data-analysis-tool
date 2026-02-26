@@ -378,93 +378,69 @@ tab_data, tab_graph, tab_analysis = st.tabs(["\U0001F4CB Data", "\U0001F4C8 Grap
 
 with tab_data:
     df = get_df()
-
-    # ── CSS for metadata row colors ──
-    st.markdown("""
-    <style>
-    .meta-row { display: flex; gap: 2px; margin-bottom: 1px; }
-    .meta-cell { flex: 1; padding: 4px 8px; font-size: 13px; border-radius: 3px; overflow: hidden; }
-    .meta-label { width: 70px; min-width: 70px; max-width: 70px; padding: 4px 6px;
-                  font-size: 12px; font-weight: 600; border-radius: 3px; }
-    .meta-name   { background: #dce8f0; }
-    .meta-units  { background: #e0f0d8; }
-    .meta-comment{ background: #f5f0d0; }
-    .meta-formula{ background: #f0dce8; }
-    .meta-header { background: #e8e8e8; font-weight: 700; }
-    </style>
-    """, unsafe_allow_html=True)
-
-    # ── Column header row ──
     cols_list = list(df.columns)
     n_c = len(cols_list)
+    ver = st.session_state.get("table_ver", 0)
 
-    # Build metadata HTML table
-    def meta_html_row(label, css_class, values):
-        cells = f'<div class="meta-label {css_class}">{label}</div>'
-        for v in values:
-            cells += f'<div class="meta-cell {css_class}">{v}</div>'
-        return f'<div class="meta-row">{cells}</div>'
+    # ── Build column_config: show display name + units in column header ──
+    col_config = {}
+    for col in cols_list:
+        meta = st.session_state.col_meta.get(col, {})
+        name = meta.get("name", "")
+        units = meta.get("units", "")
+        formula = st.session_state.formulas.get(col, "")
+        # Build header label
+        parts = [col]
+        if name: parts[0] = f"{col}: {name}"
+        if units: parts[0] += f" [{units}]"
+        if formula: parts[0] += " \u0192"  # small f to indicate formula
+        col_config[col] = st.column_config.Column(label=parts[0])
 
-    # Header row with column IDs
-    hdr_vals = [f"<b>{c}</b>" for c in cols_list]
-    names = [st.session_state.col_meta.get(c, {}).get("name", "") for c in cols_list]
-    units = [st.session_state.col_meta.get(c, {}).get("units", "") for c in cols_list]
-    comments = [st.session_state.col_meta.get(c, {}).get("comments", "") for c in cols_list]
-    formulas = [st.session_state.formulas.get(c, "") for c in cols_list]
+    # ── Data info ──
+    nn_missing = int(df.isna().sum().sum())
+    nc_num = len(df.select_dtypes(include=[np.number]).columns)
+    st.caption(f"{len(df)} rows x {n_c} cols ({nc_num} numeric"
+               f"{f', {nn_missing} missing' if nn_missing else ''})")
 
-    html = meta_html_row("", "meta-header", hdr_vals)
-    html += meta_html_row("Name", "meta-name", [n if n else '<span style="color:#aaa">...</span>' for n in names])
-    html += meta_html_row("Units", "meta-units", [u if u else '<span style="color:#aaa">...</span>' for u in units])
-    html += meta_html_row("Comment", "meta-comment", [c if c else '<span style="color:#aaa">...</span>' for c in comments])
-    html += meta_html_row("f(x)", "meta-formula", [f if f else '<span style="color:#aaa">...</span>' for f in formulas])
-
-    st.markdown(html, unsafe_allow_html=True)
-
-    # ── Editable metadata inputs ──
-    with st.expander("Edit metadata", expanded=False):
-        max_per_row = min(n_c, 4)
-        for start in range(0, n_c, max_per_row):
-            chunk = cols_list[start:start+max_per_row]
-            mcols = st.columns(len(chunk))
-            for j, col in enumerate(chunk):
-                with mcols[j]:
-                    st.markdown(f"**{col}**")
-                    meta = st.session_state.col_meta.get(col, {"name":"","units":"","comments":""})
-                    ver = st.session_state.get("table_ver", 0)
-                    nn = st.text_input("Name", meta.get("name",""), key=f"mn_{col}_{ver}")
-                    uu = st.text_input("Units", meta.get("units",""), key=f"mu_{col}_{ver}")
-                    cc = st.text_input("Comment", meta.get("comments",""), key=f"mc_{col}_{ver}")
-                    ff = st.text_input("Formula", st.session_state.formulas.get(col,""),
-                                      key=f"mf_{col}_{ver}",
-                                      help="e.g. log(ColA), diff(ColB)/diff(ColC), shift(ColA,1)")
-                    st.session_state.col_meta[col] = {"name": nn, "units": uu, "comments": cc}
-                    if ff.strip():
-                        st.session_state.formulas[col] = ff.strip()
-                    elif col in st.session_state.formulas:
-                        del st.session_state.formulas[col]
-
-    # ── Evaluate formulas ──
+    # ── Evaluate formulas before showing table ──
     if st.session_state.formulas:
         eval_formulas()
 
-    # ── Data info ──
-    nn = int(df.isna().sum().sum())
-    nc_num = len(df.select_dtypes(include=[np.number]).columns)
-    st.caption(f"{len(df)} rows x {len(df.columns)} cols ({nc_num} numeric"
-               f"{f', {nn} missing' if nn else ''})")
-
     # ── Editable data table ──
-    ver = st.session_state.get("table_ver", 0)
     edited = st.data_editor(df, num_rows="dynamic", use_container_width=True, height=500,
-                            key=f"data_editor_{ver}")
+                            column_config=col_config, key=f"data_editor_{ver}")
     set_df(edited)
 
+    # ── Column metadata editor: one row per column, inline ──
+    with st.expander("\u270F\uFE0F Edit column metadata", expanded=False):
+        # Table-like header
+        hdr = st.columns([1, 2, 1.2, 1.5, 2.5])
+        hdr[0].markdown("**Column**")
+        hdr[1].markdown("**Display name**")
+        hdr[2].markdown("**Units**")
+        hdr[3].markdown("**Comment**")
+        hdr[4].markdown("**Formula** _(e.g. `log(ColA)`, `diff(ColB)/diff(ColC)`)_")
+
+        for col in cols_list:
+            meta = st.session_state.col_meta.get(col, {"name":"","units":"","comments":""})
+            row = st.columns([1, 2, 1.2, 1.5, 2.5])
+            row[0].markdown(f"`{col}`")
+            nn = row[1].text_input("n", meta.get("name",""), key=f"mn_{col}_{ver}", label_visibility="collapsed")
+            uu = row[2].text_input("u", meta.get("units",""), key=f"mu_{col}_{ver}", label_visibility="collapsed")
+            cc = row[3].text_input("c", meta.get("comments",""), key=f"mc_{col}_{ver}", label_visibility="collapsed")
+            ff = row[4].text_input("f", st.session_state.formulas.get(col,""),
+                                   key=f"mf_{col}_{ver}", label_visibility="collapsed")
+            st.session_state.col_meta[col] = {"name": nn, "units": uu, "comments": cc}
+            if ff.strip():
+                st.session_state.formulas[col] = ff.strip()
+            elif col in st.session_state.formulas:
+                del st.session_state.formulas[col]
+
     # ── Notes ──
-    st.markdown("---")
     if "notes" not in st.session_state:
         st.session_state.notes = ""
-    st.session_state.notes = st.text_area("Notes", st.session_state.notes, height=100,
-                                           placeholder="Add experiment notes here...")
+    st.session_state.notes = st.text_area("\U0001F4DD Notes", st.session_state.notes, height=80,
+                                           placeholder="Experiment notes...")
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  GRAPH TAB
