@@ -9,7 +9,17 @@ import matplotlib as mpl
 from scipy import stats
 from scipy.optimize import curve_fit
 from scipy.signal import savgol_filter
+from st_aggrid import AgGrid, GridOptionsBuilder, GridUpdateMode
 import io, re
+
+def grid_data(response):
+    """Extract DataFrame from AgGrid response (compatible across versions)."""
+    if hasattr(response, 'data') and isinstance(response.data, pd.DataFrame):
+        return response.data
+    if isinstance(response, dict) and 'data' in response:
+        d = response['data']
+        return d if isinstance(d, pd.DataFrame) else pd.DataFrame(d)
+    return None
 
 mpl.rcParams['pdf.fonttype'] = 42
 mpl.rcParams['ps.fonttype'] = 42
@@ -382,19 +392,65 @@ with tab_data:
     n_c = len(cols_list)
     ver = st.session_state.get("table_ver", 0)
 
-    # ── Build column_config: show display name + units in column header ──
-    col_config = {}
-    for col in cols_list:
-        meta = st.session_state.col_meta.get(col, {})
-        name = meta.get("name", "")
-        units = meta.get("units", "")
-        formula = st.session_state.formulas.get(col, "")
-        # Build header label
-        parts = [col]
-        if name: parts[0] = f"{col}: {name}"
-        if units: parts[0] += f" [{units}]"
-        if formula: parts[0] += " \u0192"  # small f to indicate formula
-        col_config[col] = st.column_config.Column(label=parts[0])
+    # ── Metadata grid (one row per column) ──
+    with st.expander("Column metadata", expanded=False):
+        meta_data = []
+        for col in cols_list:
+            m = st.session_state.col_meta.get(col, {"name":"","units":"","comments":""})
+            meta_data.append({
+                "Column": col,
+                "Name": m.get("name", ""),
+                "Units": m.get("units", ""),
+                "Formula": st.session_state.formulas.get(col, ""),
+                "Comment": m.get("comments", ""),
+            })
+        meta_df = pd.DataFrame(meta_data)
+
+        gb_meta = GridOptionsBuilder.from_dataframe(meta_df)
+        gb_meta.configure_column("Column", editable=False, width=80, pinned="left",
+                                  cellStyle={"fontWeight": "bold", "backgroundColor": "#f0f0f0"})
+        gb_meta.configure_column("Name", editable=True, width=150)
+        gb_meta.configure_column("Units", editable=True, width=100)
+        gb_meta.configure_column("Formula", editable=True, width=200,
+                                  cellStyle={"fontFamily": "monospace", "backgroundColor": "#fdf6f0"})
+        gb_meta.configure_column("Comment", editable=True, width=200)
+        gb_meta.configure_grid_options(
+            domLayout='autoHeight',
+            suppressMovableColumns=True,
+            enterNavigatesVertically=True,
+            enterNavigatesVerticallyAfterEdit=True,
+        )
+
+        meta_response = AgGrid(
+            meta_df,
+            gridOptions=gb_meta.build(),
+            update_mode=GridUpdateMode.VALUE_CHANGED,
+            fit_columns_on_grid_load=True,
+            theme="streamlit",
+            key=f"meta_grid_{ver}",
+        )
+
+        # Write back
+        edited_meta = grid_data(meta_response)
+        if edited_meta is not None:
+            for _, row in edited_meta.iterrows():
+                col = str(row["Column"])
+                if col not in cols_list:
+                    continue
+                st.session_state.col_meta[col] = {
+                    "name": str(row["Name"]) if pd.notna(row["Name"]) else "",
+                    "units": str(row["Units"]) if pd.notna(row["Units"]) else "",
+                    "comments": str(row["Comment"]) if pd.notna(row["Comment"]) else "",
+                }
+                f_val = str(row["Formula"]).strip() if pd.notna(row["Formula"]) else ""
+                if f_val:
+                    st.session_state.formulas[col] = f_val
+                elif col in st.session_state.formulas:
+                    del st.session_state.formulas[col]
+
+    # ── Evaluate formulas ──
+    if st.session_state.formulas:
+        eval_formulas()
 
     # ── Data info ──
     nn_missing = int(df.isna().sum().sum())
@@ -402,39 +458,51 @@ with tab_data:
     st.caption(f"{len(df)} rows x {n_c} cols ({nc_num} numeric"
                f"{f', {nn_missing} missing' if nn_missing else ''})")
 
-    # ── Evaluate formulas before showing table ──
-    if st.session_state.formulas:
-        eval_formulas()
+    # ── Main data grid ──
+    gb = GridOptionsBuilder.from_dataframe(df)
+    gb.configure_default_column(
+        editable=True,
+        resizable=True,
+        sortable=True,
+        filter=True,
+        type=["numericColumn"],
+    )
+    # Set column headers to display name + units
+    for col in cols_list:
+        lbl = get_col_label(col)
+        header = f"{col}: {lbl}" if lbl != col else col
+        gb.configure_column(col, headerName=header)
 
-    # ── Editable data table ──
-    edited = st.data_editor(df, num_rows="dynamic", use_container_width=True, height=500,
-                            column_config=col_config, key=f"data_editor_{ver}")
-    set_df(edited)
+    gb.configure_grid_options(
+        enterNavigatesVertically=True,
+        enterNavigatesVerticallyAfterEdit=True,
+        undoRedoCellEditing=True,
+        undoRedoCellEditingLimit=20,
+        suppressMovableColumns=True,
+        stopEditingWhenCellsLoseFocus=True,
+    )
 
-    # ── Column metadata editor: one row per column, inline ──
-    with st.expander("\u270F\uFE0F Edit column metadata", expanded=False):
-        # Table-like header
-        hdr = st.columns([1, 2, 1.2, 1.5, 2.5])
-        hdr[0].markdown("**Column**")
-        hdr[1].markdown("**Display name**")
-        hdr[2].markdown("**Units**")
-        hdr[3].markdown("**Comment**")
-        hdr[4].markdown("**Formula** _(e.g. `log(ColA)`, `diff(ColB)/diff(ColC)`)_")
+    grid_response = AgGrid(
+        df,
+        gridOptions=gb.build(),
+        update_mode=GridUpdateMode.VALUE_CHANGED,
+        height=500,
+        fit_columns_on_grid_load=(n_c <= 8),
+        theme="streamlit",
+        allow_unsafe_jscode=True,
+        key=f"data_grid_{ver}",
+    )
 
-        for col in cols_list:
-            meta = st.session_state.col_meta.get(col, {"name":"","units":"","comments":""})
-            row = st.columns([1, 2, 1.2, 1.5, 2.5])
-            row[0].markdown(f"`{col}`")
-            nn = row[1].text_input("n", meta.get("name",""), key=f"mn_{col}_{ver}", label_visibility="collapsed")
-            uu = row[2].text_input("u", meta.get("units",""), key=f"mu_{col}_{ver}", label_visibility="collapsed")
-            cc = row[3].text_input("c", meta.get("comments",""), key=f"mc_{col}_{ver}", label_visibility="collapsed")
-            ff = row[4].text_input("f", st.session_state.formulas.get(col,""),
-                                   key=f"mf_{col}_{ver}", label_visibility="collapsed")
-            st.session_state.col_meta[col] = {"name": nn, "units": uu, "comments": cc}
-            if ff.strip():
-                st.session_state.formulas[col] = ff.strip()
-            elif col in st.session_state.formulas:
-                del st.session_state.formulas[col]
+    # Write back edited data
+    edited_df = grid_data(grid_response)
+    if edited_df is not None and len(edited_df) > 0:
+        # Try to coerce each column to numeric; leave as-is if it fails
+        for col in edited_df.columns:
+            converted = pd.to_numeric(edited_df[col], errors='coerce')
+            # Only convert if most values are numeric (not all NaN from failed coercion)
+            if converted.notna().any() or edited_df[col].isna().all():
+                edited_df[col] = converted
+        set_df(edited_df)
 
     # ── Notes ──
     if "notes" not in st.session_state:
